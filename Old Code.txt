@@ -1,0 +1,147 @@
+Now the line still appears, but no text:
+
+
+```cpp
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ESP32Encoder.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_ADDR 0x3C
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+const int SEAM = 128;
+
+BLECharacteristic *pCharacteristic;
+bool deviceConnected = false;
+
+TwoWire I2CBus1 = TwoWire(0);
+TwoWire I2CBus2 = TwoWire(1);
+
+Adafruit_SSD1306 displayA(128, 64, &I2CBus1, -1);
+Adafruit_SSD1306 displayB(128, 64, &I2CBus2, -1);
+GFXcanvas1 canvas(256, 64);
+
+ESP32Encoder encoder;
+
+long lastPosition = 0;
+
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) { deviceConnected = true; Serial.println("Connected"); }
+  void onDisconnect(BLEServer* pServer) {
+    deviceConnected = false;
+    Serial.println("Disconnected");
+    pServer->getAdvertising()->start();
+  }
+};
+
+class MyCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pChar) {
+    String value = pChar->getValue().c_str();
+    Serial.print("Received: ");
+    Serial.println(value);
+  }
+};
+
+void drawSafeText(String text, int x, int y) {
+  int16_t x1, y1;
+  uint16_t w, h;
+  canvas.setTextSize(1); // match whatever size you're using
+  canvas.getTextBounds(text, x, y, &x1, &y1, &w, &h);
+
+  int endX = x1 + w;
+
+  // If text starts before the seam but ends after it, it's straddling - push to next screen
+  if (x1 < SEAM && endX > SEAM) {
+    x = SEAM + 4; // small margin so it doesn't hug the bezel edge
+  }
+};
+
+void pushCanvasToDisplays() {
+  displayA.clearDisplay();
+  displayB.clearDisplay();
+
+  for (int y = 0; y < 64; y++) {
+    for (int x = 0; x < 256; x++) {
+      if (canvas.getPixel(x, y)) {
+        if (x < SEAM) {
+          displayA.drawPixel(x, y, SSD1306_WHITE);
+        } else {
+          displayB.drawPixel(x - SEAM, y, SSD1306_WHITE);
+        }
+      }
+    }
+  }
+
+  displayA.display();
+  displayB.display();
+}
+
+void btSetup(){
+  BLEDevice::init("Cam's Toolbox");
+  BLEServer *pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pCharacteristic = pService->createCharacteristic(
+    CHARACTERISTIC_UUID,
+    BLECharacteristic::PROPERTY_READ |
+    BLECharacteristic::PROPERTY_WRITE |
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pCharacteristic->setCallbacks(new MyCallbacks());
+  pCharacteristic->addDescriptor(new BLE2902());
+  pCharacteristic->setValue("Ready");
+
+  pService->start();
+  pServer->getAdvertising()->start();
+  Serial.println("BLE advertising started");
+}
+
+void setup() {
+  Serial.begin(115200);
+  btSetup();
+  I2CBus1.begin(8, 9);
+  I2CBus2.begin(4, 5);
+  encoder.attachHalfQuad(6, 7);
+  encoder.setCount(0);
+
+  if(!displayA.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)){
+    Serial.println("OLED 1 not found");
+    while(1);
+  }
+
+  if(!displayB.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)){
+    Serial.println("OLED 2 not found");
+    while(1);
+  }
+
+ Serial.println("OLED found");
+  canvas.setTextSize(2);
+  canvas.setTextColor(SSD1306_WHITE);
+  canvas.setCursor(40, 20); 
+  drawSafeText("100nF Ceramic Cap", 100, 10);  // would straddle seam - gets pushed
+  drawSafeText("Qty: 25", 20, 30);             // fits fine on left, stays put
+
+  canvas.drawLine(0, 32, 255, 32, SSD1306_WHITE); 
+
+  pushCanvasToDisplays();
+  
+  
+}
+
+
+
+
+void loop() {
+}
+
+
+```
