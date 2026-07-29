@@ -1,0 +1,126 @@
+# Implementation Instructions: Update WiFi, SD Card, and I2C Scan
+
+## File: `Firmware for Toolbox/src/config.h`
+
+### Change 1: Update WiFi AP credentials to match ConfirmedCode.txt style
+
+Replace lines 38-43 with:
+
+```cpp
+// WiFi Access Point (open network for testing)
+#define AP_SSID "ESP32-Test"
+#define AP_PASSWORD ""
+#define AP_CHANNEL 1
+#define AP_HIDDEN false
+#define AP_MAX_CONNECTIONS 4
+```
+
+---
+
+## File: `Firmware for Toolbox/src/main.cpp`
+
+### Change 2: Update WiFi setup in `setup()` to match ConfirmedCode.txt style (lines ~877-903)
+
+Replace the current WiFi section with this pattern:
+
+1. Call `WiFi.disconnect(true)` before starting AP to clear any previous station-mode connections
+2. Add a 100ms delay after disconnect to allow WiFi stack to settle
+3. Set `WiFi.mode(WIFI_AP)` exclusively (no station mode)
+4. Start softAP with open network (no password)
+5. Verify AP start success; if failed, hang in error loop: `while(1) { Serial.println("Failed to start AP"); delay(1000); }`
+6. Report AP IP address, MAC address, and connected station count via Serial
+
+After the initial WiFi setup (after webserver.begin()), add a station monitoring block:
+
+```cpp
+// Monitor connected stations every 5 seconds for 30 seconds total (6 cycles)
+Serial.println("Monitoring connected stations...");
+for (int i = 0; i < 6; i++) {
+    delay(5000);
+    Serial.printf("Connected stations: %d\n", WiFi.softAPgetStationNum());
+}
+```
+
+### Change 3: Update SD card initialization to match ConfirmedCode.txt test style (lines ~851-875)
+
+Replace the current SD card section with this pattern:
+
+1. Create a separate `SPIClass` instance for HSPI bus instead of using default SPI:
+   ```cpp
+   SPIClass hspi = SPIClass(HSPI);
+   ```
+
+2. Manual pin configuration before SPI begin:
+   ```cpp
+   pinMode(SD_CLK, OUTPUT);
+   pinMode(SD_MISO, INPUT);
+   pinMode(SD_MOSI, OUTPUT);
+   pinMode(SD_CS, OUTPUT);
+   digitalWrite(SD_CS, HIGH);  // CS set HIGH before init
+   ```
+
+3. Custom SPI begin with explicit pin mapping:
+   ```cpp
+   hspi.begin(SD_CLK, SD_MISO, SD_MOSI, SD_CS);
+   ```
+
+4. Use `hspi` as the bus parameter for `SD.begin()`:
+   ```cpp
+   if (SD.begin(SD_CS, hspi)) { ... }
+   ```
+
+5. Add card type detection: distinguish between MMC, SDHC, SDSC formats using `card.type()`
+6. Add card size calculation: report in GB if capacity >= 1GB threshold, otherwise MB
+7. Keep the file write/read test pattern (create /items.json, read back)
+8. Keep directory listing iteration showing filename and size
+
+### Change 4: Add I2C pre-initialization scan before display init (in `setup()`, lines ~825-826)
+
+Before calling `initDisplays()`, add an I2C scan on both buses to verify device presence at address 0x3C:
+
+```cpp
+// Pre-init I2C scan for OLED A (Bus 0)
+Serial.print("Scanning I2C Bus 0 (OLED A)... ");
+I2CBus1.begin(OLED1_SDA, OLED1_SCL);
+bool oledAFound = false;
+Wire.beginTransmission(0x3C);
+if (Wire.endTransmission() == 0) {
+    Serial.println("Device found at 0x3C");
+    oledAFound = true;
+} else {
+    Serial.println("No device at 0x3C on Bus 0");
+}
+
+// Pre-init I2C scan for OLED B (Bus 1)
+Serial.print("Scanning I2C Bus 1 (OLED B)... ");
+I2CBus2.begin(OLED2_SDA, OLED2_SCL);
+bool oledBFound = false;
+Wire.beginTransmission(0x3C);
+if (Wire.endTransmission() == 0) {
+    Serial.println("Device found at 0x3C");
+    oledBFound = true;
+} else {
+    Serial.println("No device at 0x3C on Bus 1");
+}
+
+// Then call initDisplays() as normal
+Serial.println("[1/5] Initializing displays...");
+initDisplays();
+```
+
+Note: The I2C scan in `display.cpp` (`initDisplays`) already calls `I2CBus1.begin()` and `I2CBus2.begin()`. To avoid duplicate begin calls, either:
+- Option A: Remove the `begin()` calls from `initDisplays()` in display.cpp since they're called during scan
+- Option B: Use a separate Wire instance for scanning (but this is more complex)
+
+Recommend Option A: In `display.cpp` `initDisplays()`, remove or guard the `I2CBus1.begin()` and `I2CBus2.begin()` calls, since they are now called before `initDisplays()` during the scan phase. The `beginTransmission/endTransmission` scan already initializes the buses.
+
+---
+
+## Summary of all changes:
+
+| # | File | Change |
+|---|------|--------|
+| 1 | `config.h` | WiFi SSID → "ESP32-Test", password → "" (open) |
+| 2 | `main.cpp` setup() | WiFi: add disconnect, mode(WIFI_AP), station monitoring loop |
+| 3 | `main.cpp` setup() | SD card: use SPIClass(HSPI), manual pinMode, hspi.begin(), card type/size detection |
+| 4 | `main.cpp` + `display.cpp` | I2C scan before display init; remove duplicate begin() calls from display.cpp |

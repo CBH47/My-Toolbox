@@ -1,0 +1,231 @@
+================================================================================
+                        CONFIRMED TEST SUITE DOCUMENTATION
+                     ESP32-S3 Hardware Testing - 4D Systems Gen4 Board
+================================================================================
+
+PROJECT OVERVIEW
+--------------------------------------------------------------------------------
+Board:          4d_systems_esp32s3_gen4_r8n16 (ESP32-S3, 8MB RAM, 16MB Flash)
+Framework:      Arduino (espressif32 platform)
+Build System:   PlatformIO
+Serial Baud:    115200
+Library:        Adafruit_SSD1306 @^2.5.10 (via lib_deps)
+
+Each test is a standalone firmware binary compiled via separate PlatformIO
+environments using build_src_filter to include only one .cpp file per target.
+
+
+================================================================================
+TEST 1: LED Test (test_led.cpp)
+================================================================================
+Purpose:        Verify GPIO output and PWM capability on built-in LED
+GPIO Pin:       GPIO38 (OUTPUT)
+
+Design Choices:
+- Uses digital write for basic blink test (5 cycles, ~1Hz) to confirm pin
+  toggling works correctly.
+- Uses ESP32 LEDC (LED Control) hardware PWM peripheral for brightness ramp
+  instead of software PWM, providing accurate analog-like control.
+- PWM config: channel=0, frequency=5000Hz, resolution=8-bit (0-255 duty).
+- Ramps up from 0 to 255 in steps of 5 (50ms per step), then ramps down.
+- Detaches pin and sets duty to 0 after test completes.
+
+Protocol:       Direct GPIO digital I/O + ESP32 LEDC hardware PWM
+Libraries:      Arduino core (esp32) - built-in pinMode, digitalWrite,
+                ledcSetup, ledcAttachPin, ledcWrite, ledcDetachPin
+
+
+================================================================================
+TEST 2: Button Test (test_button.cpp)
+================================================================================
+Purpose:        Verify button input with pull-up resistor and debouncing
+GPIO Pin:       GPIO6 (INPUT_PULLUP, active LOW)
+
+Design Choices:
+- Uses internal INPUT_PULLUP mode; button connects pin to GND when pressed.
+- Active-LOW logic: LOW = pressed, HIGH = idle/released.
+- Software debounce: 50ms delay threshold using millis() timestamp comparison.
+- Tracks press duration in milliseconds and reports on release event.
+- Non-blocking polling loop with 10ms delay (no interrupts used).
+
+Protocol:       Direct GPIO digital input with software debouncing
+Libraries:      Arduino core - pinMode, digitalRead, millis
+
+
+================================================================================
+TEST 3: OLED A Test (test_oled_a.cpp)
+================================================================================
+Purpose:        Verify I2C Bus 0 and SSD1306 OLED display (Display A)
+I2C Bus:        Bus 0 (TwoWire(0))
+SDA Pin:        GPIO8
+SCL Pin:        GPIO5
+Device Address: 0x3C
+Resolution:     128x64 pixels
+
+Design Choices:
+- Creates dedicated TwoWire instance for I2C Bus 0 with custom pins.
+- I2C speed: 400kHz (fast mode).
+- Pre-initialization I2C scan: beginTransmission/endTransmission to verify
+  device presence at address 0x3C before display init.
+- Uses Adafruit_SSD1306 library constructor with TwoWire pointer and address.
+- Display initialization via SSD1306_SWITCHCAPVCC (internal charge pump).
+- Test pattern: static text showing "OLED A Test", bus info, and pin mapping.
+- Flash test: 3 cycles of clear/display then "FLASH" text/display to verify
+  refresh capability.
+- Final screen: "ALL TESTS PASSED" message.
+
+Protocol:       I2C (400kHz fast mode), SSD1306 display controller
+Libraries:      Adafruit_GFX, Adafruit_SSD1306
+
+
+================================================================================
+TEST 4: OLED B Test (test_oled_b.cpp)
+================================================================================
+Purpose:        Verify I2C Bus 1 and SSD1306 OLED display (Display B)
+I2C Bus:        Bus 1 (TwoWire(1))
+SDA Pin:        GPIO4
+SCL Pin:        GPIO5
+Device Address: 0x3C
+Resolution:     128x64 pixels
+
+Design Choices:
+- Identical methodology to OLED A test but on separate I2C bus.
+- Creates dedicated TwoWire instance for I2C Bus 1 with custom pins.
+- Same pre-initialization device detection, flash test, and final status
+  display pattern as OLED A.
+- Allows independent verification of both I2C buses simultaneously.
+
+Protocol:       I2C (400kHz fast mode), SSD1306 display controller
+Libraries:      Adafruit_GFX, Adafruit_SSD1306
+
+
+================================================================================
+TEST 5: Rotary Encoder Test (test_rotary_encoder.cpp)
+================================================================================
+Purpose:        Verify quadrature rotary encoder with interrupt-driven counting
+GPIO Pins:      GPIO15 (Channel A), GPIO16 (Channel B)
+
+Design Choices:
+- Both channels configured as INPUT_PULLUP for clean signal levels.
+- Interrupt-driven: attachInterrupt on both pins with CHANGE trigger mode.
+- IRAM_ATTR ISR functions for fast execution in internal RAM (avoids flash
+  fetch latency on ESP32-S3).
+- Quadrature decoding logic: direction determined by comparing state of the
+  non-triggering channel when the triggering channel changes.
+  - Clockwise: A leads B (or B lags A) -> count++
+  - Counter-clockwise: B leads A (or A lags B) -> count--
+- Minimal ISR: 1 microsecond debounce delay + digitalRead + counter update
+  + flag set. All heavy work done in main loop.
+- Atomic access to shared variables via noInterrupts()/interrupts() around
+  encoderCount reads to prevent torn reads on multi-byte values.
+- Polling loop with 10ms delay; prints count changes and periodic status
+  every 5 seconds.
+
+Protocol:       GPIO external interrupts, quadrature decoding
+Libraries:      Arduino core - pinMode, attachInterrupt, digitalRead,
+                noInterrupts, interrupts, millis
+
+
+================================================================================
+TEST 6: SD Card Test (test_sd_card.cpp)
+================================================================================
+Purpose:        Verify SPI-based SD card initialization and file I/O
+SPI Bus:        HSPI (secondary hardware SPI)
+CS Pin:         GPIO46
+SCK Pin:        GPIO10
+MOSI Pin:       GPIO11
+MISO Pin:       GPIO12
+
+Design Choices:
+- Uses secondary Hardware SPI bus (HSPI) via SPIClass to avoid conflicts
+  with primary SPI (VSPI) which may be used by onboard flash or display.
+- Manual pin configuration: pinMode for SCK/MOSI (OUTPUT), MISO (INPUT),
+  CS (OUTPUT); CS set HIGH before init.
+- Custom SPI begin: hspi.begin(SCK, MISO, MOSI, CS) with explicit pin mapping
+  required for this board's non-standard SPI pinout.
+- Card type detection: distinguishes between MMC, SDHC, SDSC formats.
+- Card size calculation: reports in GB or MB based on capacity threshold.
+- File write test: creates /test.txt with two lines of text using FILE_WRITE
+  mode (creates if absent, appends if exists).
+- File read test: opens /test.txt and streams contents byte-by-byte to Serial.
+- Directory listing: iterates root directory entries showing filename and size.
+
+Protocol:       SPI (HSPI bus), SD/MMC file system
+Libraries:      Arduino core - SPI (SPIClass), SD
+
+
+================================================================================
+TEST 7: WiFi AP Test (test_wifi_ap.cpp)
+================================================================================
+Purpose:        Verify ESP32-S3 WiFi Access Point mode operation
+SSID:           "ESP32-Test"
+Password:       "" (open/unsecured network for testing)
+
+Design Choices:
+- Sets WiFi.mode(WIFI_AP) exclusively (no station mode).
+- Calls WiFi.disconnect(true) before starting AP to clear any previous
+  station-mode connections and ensure clean state.
+- 100ms delay after disconnect to allow WiFi stack to settle.
+- Starts softAP with open network (no password) for easy client connectivity
+  during testing.
+- Verifies AP start success; hangs in error loop if failed.
+- Reports AP IP address (default 192.168.4.1), MAC address, and connected
+  station count via Serial.
+- Monitors connected stations every 5 seconds for 30 seconds total (6 cycles)
+  to observe client association behavior.
+
+Protocol:       WiFi IEEE 802.11 (Access Point / softAP mode)
+Libraries:      Arduino core - WiFi
+
+
+================================================================================
+PLATFORMIO BUILD CONFIGURATION
+================================================================================
+Base environment: env:4d_systems_esp32s3_gen4_r8n16
+  - platform: espressif32
+  - board: 4d_systems_esp32s3_gen4_r8n16
+  - framework: arduino
+  - upload_port: COM11
+  - monitor_speed: 115200
+  - lib_deps: adafruit/Adafruit SSD1306@^2.5.10
+
+Each test environment extends the base and uses build_src_filter to compile
+only its specific source file:
+  [env:test_oled_a]      -> +<test_oled_a.cpp>
+  [env:test_oled_b]      -> +<test_oled_b.cpp>
+  [env:test_rotary_encoder] -> +<test_rotary_encoder.cpp>
+  [env:test_button]      -> +<test_button.cpp>
+  [env:test_sd_card]     -> +<test_sd_card.cpp>
+  [env:test_led]         -> +<test_led.cpp>
+  [env:test_wifi_ap]     -> +<test_wifi_ap.cpp>
+
+Build command: platformio run -e <test_environment_name>
+
+
+================================================================================
+HARDWARE PIN SUMMARY
+================================================================================
+Component       Pin(s)          Mode/Protocol
+------          ----            -------------
+LED             GPIO38          OUTPUT / LEDC PWM
+Button          GPIO6           INPUT_PULLUP (active LOW)
+OLED A (Disp A) GPIO8=SDA, GPIO9=SCL  I2C Bus 0 @400kHz, addr 0x3C
+OLED B (Disp B) GPIO4=SDA, GPIO5=SCL  I2C Bus 1 @400kHz, addr 0x3C
+Rotary Encoder  GPIO15=A, GPIO16=B  INPUT_PULLUP / EXT interrupts
+SD Card         GPIO46=CS, 10=SCK, 11=MOSI, 12=MISO  HSPI
+WiFi            Built-in ESP32-S3 WiFi    802.11 softAP
+
+
+================================================================================
+RECREATION NOTES FOR ANOTHER AGENT
+================================================================================
+1. Board must be flashed individually per test (no single binary runs all tests).
+2. All tests use Serial.println() for output; connect Serial Monitor at 115200 baud.
+3. Tests run in infinite loops after completion (loop() is empty) - reset required to re-run.
+4. Error conditions cause the firmware to hang in a delay loop (while(1)) with error message on Serial.
+5. The Adafruit_SSD1306 library must be added via PlatformIO lib_deps before building OLED tests.
+6. For WiFi AP test, connect a phone/laptop to "ESP32-Test" network to verify client association.
+7. SD card must be formatted (FAT32) and properly inserted for SD card test to pass.
+8. Rotary encoder must have push-button switch output connected to GPIO15/GPIO16 with pull-ups.
+
+================================================================================
