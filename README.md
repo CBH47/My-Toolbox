@@ -11,6 +11,8 @@ All pin references below are ESP32-S3 GPIO numbers as defined in the firmware so
 | --- | --- | --- |
 | SDA | GPIO 8 | Defined in firmware as OLED_A_SDA |
 | SCL | GPIO 9 | Defined in firmware as OLED_A_SCL |
+| VCC | 3V3 | Power rail for OLED A |
+| GND | GND | Ground rail for OLED A |
 
 ### OLED B (I2C)
 
@@ -18,6 +20,8 @@ All pin references below are ESP32-S3 GPIO numbers as defined in the firmware so
 | --- | --- | --- |
 | SDA | GPIO 4 | Defined in firmware as OLED_B_SDA |
 | SCL | GPIO 5 | Defined in firmware as OLED_B_SCL |
+| VCC | 3V3 | Power rail for OLED B |
+| GND | GND | Ground rail for OLED B |
 
 ### Rotary Encoder
 
@@ -25,12 +29,16 @@ All pin references below are ESP32-S3 GPIO numbers as defined in the firmware so
 | --- | --- | --- |
 | CLK (A) | GPIO 15 | Defined in firmware as ENCODER_PIN_A |
 | DT (B) | GPIO 16 | Defined in firmware as ENCODER_PIN_B |
+| VCC | 3V3 | Encoder power pin |
+| GND | GND | Encoder ground pin |
 
 ### Select Button
 
 | Peripheral Signal | ESP32 Pin | Notes |
 | --- | --- | --- |
 | Button Input | GPIO 6 | Active low, uses INPUT_PULLUP |
+| VCC | Not connected | Input uses internal pull-up, no external VCC needed |
+| GND | GND | Other button terminal to ground |
 
 ### SD Card (SPI)
 
@@ -40,6 +48,8 @@ All pin references below are ESP32-S3 GPIO numbers as defined in the firmware so
 | SCK | GPIO 10 | Defined in firmware as SD_SCK_PIN |
 | MOSI | GPIO 11 | Defined in firmware as SD_MOSI_PIN |
 | MISO | GPIO 12 | Defined in firmware as SD_MISO_PIN |
+| VCC | 3V3 | SD module/card power |
+| GND | GND | SD module/card ground |
 
 ### Wi-Fi Access Point
 
