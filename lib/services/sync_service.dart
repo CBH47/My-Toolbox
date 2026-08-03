@@ -1,229 +1,372 @@
-import 'dart:convert';
-import 'package:http/http.dart' as http;
-import 'package:shared_preferences/shared_preferences.dart';
-import 'package:uuid/uuid.dart';
-import '../models/inventory_item.dart';
-import 'database_service.dart';
+import '../models/component.dart';
+import '../models/folder.dart';
+import '../services/database_service.dart';
+import '../services/firmware_api_service.dart';
+
+enum ConflictChoice { esp, app }
+
+class ComponentConflict {
+  final String id;
+  final Component? espComponent;
+  final Component? appComponent;
+
+  const ComponentConflict({
+    required this.id,
+    required this.espComponent,
+    required this.appComponent,
+  });
+}
+
+class FolderConflict {
+  final String id;
+  final Folder? espFolder;
+  final Folder? appFolder;
+
+  const FolderConflict({
+    required this.id,
+    required this.espFolder,
+    required this.appFolder,
+  });
+}
+
+class SyncResult {
+  final bool success;
+  final int itemCount;
+  final String? error;
+  final List<ComponentConflict> conflicts;
+  final List<FolderConflict> folderConflicts;
+
+  SyncResult({
+    required this.success,
+    this.itemCount = 0,
+    this.error,
+    this.conflicts = const [],
+    this.folderConflicts = const [],
+  });
+}
 
 class SyncService {
   static final SyncService _instance = SyncService._internal();
   factory SyncService() => _instance;
   SyncService._internal();
 
+  final FirmwareApiService _api = FirmwareApiService();
   final DatabaseService _db = DatabaseService();
-  String? _espIp;
-  bool _isConnected = false;
-  String? _clientId;
 
-  String? get espIp => _espIp;
-  bool get isConnected => _isConnected;
+  bool get isConnected => _api.isConnected;
+  String? get espIp => _api.espIp;
+  String? get lastConnectionError => _api.lastConnectionError;
+  String? get lastDeleteError => _api.lastDeleteError;
+  String? get lastFolderError => _api.lastFolderError;
 
   void setEspIp(String ip) {
-    _espIp = ip;
-    _isConnected = true;
+    _api.setEspIp(ip);
   }
 
-  void disconnect() {
-    _isConnected = false;
+  void setConnectionState(bool connected) {
+    _api.setConnectionState(connected);
   }
 
   Future<bool> checkConnection() async {
-    if (_espIp == null) return false;
-    try {
-      final response = await http.get(
-        Uri.parse('http://$_espIp/api/status'),
-        headers: {'Accept': 'application/json'},
-      ).timeout(const Duration(seconds: 5));
-      _isConnected = response.statusCode == 200;
-      return _isConnected;
-    } catch (e) {
-      _isConnected = false;
-      return false;
-    }
+    return await _api.checkConnection();
   }
 
-  Future<List<InventoryItem>> fetchItems() async {
-    if (_espIp == null || !await checkConnection()) return [];
-    try {
-      final response = await http.get(
-        Uri.parse('http://$_espIp/api/items'),
-        headers: {'Accept': 'application/json'},
-      ).timeout(const Duration(seconds: 10));
+  bool _componentsEqual(Component a, Component b) {
+    return a.id == b.id &&
+        a.name == b.name &&
+        a.quantity == b.quantity &&
+        a.price.toStringAsFixed(2) == b.price.toStringAsFixed(2) &&
+        a.x == b.x &&
+        a.y == b.y &&
+        a.folderId == b.folderId;
+  }
 
-      if (response.statusCode == 200) {
-        final List<dynamic> jsonList = jsonDecode(response.body);
-        return jsonList.map((j) => InventoryItem.fromJson(j as Map<String, dynamic>)).toList();
-      }
-    } catch (e) {
-      print('Error fetching items: $e');
+  Future<Map<String, Component>> _getLocalComponentMap() async {
+    final folders = await _db.getAllFolders();
+    final byId = <String, Component>{};
+
+    final rootComponents = await _db.getComponentsByFolder('root');
+    for (final component in rootComponents) {
+      byId[component.id] = component;
     }
-    return [];
+
+    for (final folder in folders) {
+      final components = await _db.getComponentsByFolder(folder.id);
+      for (final component in components) {
+        byId[component.id] = component;
+      }
+    }
+    return byId;
+  }
+
+  Map<String, Component> _getFirmwareComponentMap(Folder root) {
+    final byId = <String, Component>{};
+    for (final component in root.getAllComponents()) {
+      byId[component.id] = component;
+    }
+    return byId;
+  }
+
+  Future<Map<String, Folder>> _getLocalFolderMap() async {
+    final folders = await _db.getAllFolders();
+    final byId = <String, Folder>{};
+    for (final folder in folders) {
+      if (folder.id == 'root') continue;
+      byId[folder.id] = folder;
+    }
+    return byId;
+  }
+
+  Map<String, Folder> _getFirmwareFolderMap(Folder root) {
+    final byId = <String, Folder>{};
+    for (final folder in root.getAllFolders()) {
+      if (folder.id == 'root') continue;
+      byId[folder.id] = folder;
+    }
+    return byId;
+  }
+
+  bool _foldersEqual(Folder a, Folder b) {
+    return a.id == b.id && a.name == b.name && a.parentId == b.parentId;
   }
 
   Future<SyncResult> syncItems() async {
-    if (_espIp == null || !await checkConnection()) {
-      return SyncResult(success: false, error: 'Cannot connect to Toolbox ESP');
+    if (!isConnected) {
+      return SyncResult(success: false, error: 'Not connected to ESP');
     }
 
     try {
-      // Get local client ID for tracking
-      String clientId = await _getClientId();
+      final firmwareFolder = await _api.fetchInventory();
+      final espById = _getFirmwareComponentMap(firmwareFolder);
+      final appById = await _getLocalComponentMap();
+      final espFoldersById = _getFirmwareFolderMap(firmwareFolder);
+      final appFoldersById = await _getLocalFolderMap();
 
-      // Get non-deleted local items to send to ESP
-      List<InventoryItem> localItems = await _db.getAllItems();
-      List<Map<String, dynamic>> itemsToSend = localItems.map((i) => i.toJson()).toList();
+      final allIds = <String>{...espById.keys, ...appById.keys};
+      final conflicts = <ComponentConflict>[];
 
-      final payload = jsonEncode({
-        'client_id': clientId,
-        'items': itemsToSend,
-      });
-
-      final response = await http.post(
-        Uri.parse('http://$_espIp/api/sync'),
-        headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
-        body: payload,
-      ).timeout(const Duration(seconds: 15));
-
-      if (response.statusCode == 200) {
-        final Map<String, dynamic> data = jsonDecode(response.body);
-        
-        // ESP always wins - replace local items with server's authoritative list
-        if (data['items'] != null && data['items'] is List) {
-          List<InventoryItem> serverItems = (data['items'] as List<dynamic>)
-              .map((j) => InventoryItem.fromJson(j as Map<String, dynamic>))
-              .toList();
-
-          // Merge into local database (ESP's version wins for conflicts)
-          await _db.mergeItems(serverItems);
-
-          return SyncResult(
-            success: true,
-            items: serverItems,
-            itemCount: serverItems.length,
-            serverWins: data['server_wins'] == true,
-          );
-        } else {
-          // Fallback: fetch fresh items from ESP
-          List<InventoryItem> fetched = await fetchItems();
-          await _db.mergeItems(fetched);
-
-          return SyncResult(
-            success: true,
-            items: fetched,
-            itemCount: fetched.length,
-          );
+      for (final id in allIds) {
+        final esp = espById[id];
+        final app = appById[id];
+        if (esp == null || app == null || !_componentsEqual(esp, app)) {
+          conflicts.add(ComponentConflict(id: id, espComponent: esp, appComponent: app));
         }
-      } else {
-        return SyncResult(success: false, error: 'Sync failed with status ${response.statusCode}');
       }
+
+      final allFolderIds = <String>{...espFoldersById.keys, ...appFoldersById.keys};
+      final folderConflicts = <FolderConflict>[];
+      for (final id in allFolderIds) {
+        final espFolder = espFoldersById[id];
+        final appFolder = appFoldersById[id];
+        if (espFolder == null || appFolder == null || !_foldersEqual(espFolder, appFolder)) {
+          folderConflicts.add(FolderConflict(id: id, espFolder: espFolder, appFolder: appFolder));
+        }
+      }
+
+      return SyncResult(
+        success: true,
+        itemCount: appById.length,
+        conflicts: conflicts,
+        folderConflicts: folderConflicts,
+      );
     } catch (e) {
       return SyncResult(success: false, error: e.toString());
     }
   }
 
-  Future<bool> addItem(InventoryItem item) async {
-    if (_espIp == null || !await checkConnection()) {
-      // Save locally only
-      await _db.insertItem(item);
+  Future<void> resolveComponentConflictWithValue(ComponentConflict conflict, Component? resolvedComponent) async {
+    final esp = conflict.espComponent;
+
+    if (resolvedComponent == null) {
+      await _db.deleteComponentById(conflict.id);
+      if (isConnected && esp != null) {
+        await _api.deleteComponent(id: esp.id, folderId: esp.folderId);
+      }
+      return;
+    }
+
+    await _db.insertComponent(resolvedComponent);
+    if (!isConnected) return;
+
+    if (esp != null) {
+      await _api.deleteComponent(id: esp.id, folderId: esp.folderId);
+    }
+
+    await _api.addComponent(
+      id: resolvedComponent.id,
+      name: resolvedComponent.name,
+      quantity: resolvedComponent.quantity,
+      price: resolvedComponent.price,
+      x: resolvedComponent.x,
+      y: resolvedComponent.y,
+      folderId: resolvedComponent.folderId,
+    );
+  }
+
+  Future<void> resolveComponentConflict(ComponentConflict conflict, ConflictChoice choice) async {
+    final resolved = choice == ConflictChoice.esp ? conflict.espComponent : conflict.appComponent;
+    await resolveComponentConflictWithValue(conflict, resolved);
+  }
+
+  Future<void> resolveFolderConflict(FolderConflict conflict, ConflictChoice choice) async {
+    final esp = conflict.espFolder;
+    final app = conflict.appFolder;
+
+    if (choice == ConflictChoice.esp) {
+      if (esp == null) {
+        if (app != null) {
+          await _db.deleteFolderCascade(app.id);
+        }
+        return;
+      }
+
+      await _db.insertFolder(esp);
+      return;
+    }
+
+    // ConflictChoice.app
+    if (app == null) {
+      if (esp != null) {
+        await _db.deleteFolderCascade(esp.id);
+        if (isConnected) {
+          await _api.deleteFolder(id: esp.id, cascade: true);
+        }
+      }
+      return;
+    }
+
+    await _db.insertFolder(app);
+
+    if (!isConnected) return;
+
+    if (esp == null) {
+      await _api.addFolder(
+        app.name,
+        parentId: app.parentId.isEmpty ? 'root' : app.parentId,
+        id: app.id,
+      );
+      return;
+    }
+
+    if (esp.name != app.name) {
+      await _api.renameFolder(id: app.id, name: app.name);
+    }
+    if (esp.parentId != app.parentId) {
+      await _api.moveFolder(id: app.id, parentId: app.parentId.isEmpty ? 'root' : app.parentId);
+    }
+  }
+
+  Future<bool> addItem(Component component) async {
+    if (isConnected) {
+      await _api.addComponent(
+        id: component.id,
+        name: component.name,
+        quantity: component.quantity,
+        price: component.price,
+        x: component.x,
+        y: component.y,
+        folderId: component.folderId,
+      );
+    }
+
+    await _db.insertComponent(component);
+    return true;
+  }
+
+  Future<bool> deleteItem(Component component) async {
+    if (isConnected) {
+      await _api.deleteComponent(
+        id: component.id,
+        folderId: component.folderId,
+      );
+    }
+
+    await _db.deleteComponentById(component.id);
+    return true;
+  }
+
+  Future<bool> replaceItem({
+    required Component oldComponent,
+    required Component updatedComponent,
+  }) async {
+    final addSuccess = await addItem(updatedComponent);
+    if (!addSuccess) {
+      return false;
+    }
+
+    final deleteOldSuccess = await deleteItem(oldComponent);
+    if (deleteOldSuccess) {
       return true;
     }
 
-    try {
-      final response = await http.post(
-        Uri.parse('http://$_espIp/api/items'),
-        headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
-        body: jsonEncode(item.toJson()),
-      ).timeout(const Duration(seconds: 10));
-
-      if (response.statusCode == 200) {
-        // Save locally too for consistency
-        await _db.insertItem(item);
-        return true;
-      }
-    } catch (e) {
-      print('Error adding item: $e');
-    }
-
-    // Fallback to local only
-    await _db.insertItem(item);
+    // Best-effort rollback so failed edits do not leave duplicates.
+    await deleteItem(updatedComponent);
     return false;
   }
 
-  Future<bool> deleteItem(String id, {double? timestamp}) async {
-    double ts = timestamp ?? (DateTime.now().millisecondsSinceEpoch / 1000.0);
-    
-    if (_espIp == null || !await checkConnection()) {
-      await _db.softDeleteItem(id, ts);
-      return true;
+
+  Future<bool> addFolder(String name, {String parentId = ''}) async {
+    final newId = 'fld_${DateTime.now().millisecondsSinceEpoch}';
+    if (isConnected) {
+      await _api.addFolder(name, parentId: parentId, id: newId);
     }
 
-    try {
-      final response = await http.delete(
-        Uri.parse('http://$_espIp/api/items?id=$id'),
-        headers: {'Accept': 'application/json'},
-      ).timeout(const Duration(seconds: 10));
+    final newFolder = Folder(
+      id: newId,
+      name: name,
+      parentId: parentId.isNotEmpty && parentId != 'root' ? parentId : '',
+    );
+    await _db.insertFolder(newFolder);
 
-      if (response.statusCode == 200) {
-        await _db.softDeleteItem(id, ts);
-        return true;
-      }
-    } catch (e) {
-      print('Error deleting item: $e');
-    }
-
-    // Fallback to local only
-    await _db.softDeleteItem(id, ts);
-    return false;
+    return true;
   }
 
-  Future<String> _getClientId() async {
-    if (_clientId != null) return _clientId!;
-    
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      String? id = prefs.getString('toolbox_client_id');
-      if (id == null) {
-        id = 'flutter_${const Uuid().v4()}';
-        await prefs.setString('toolbox_client_id', id);
-      }
-      _clientId = id;
-    } catch (e) {
-      _clientId = 'flutter_unknown';
-    }
-    return _clientId!;
+  Future<List<Folder>> getFolders() async {
+    return await _db.getAllFolders();
   }
 
-  Future<Map<String, dynamic>> getStatus() async {
-    if (_espIp == null) return {'error': 'No ESP IP configured'};
-    
-    try {
-      final response = await http.get(
-        Uri.parse('http://$_espIp/api/status'),
-        headers: {'Accept': 'application/json'},
-      ).timeout(const Duration(seconds: 5));
-
-      if (response.statusCode == 200) {
-        return jsonDecode(response.body) as Map<String, dynamic>;
-      }
-    } catch (e) {
-      return {'error': e.toString()};
-    }
-    return {'error': 'Failed to get status'};
+  Future<List<Component>> getComponentsByFolder(String folderId) async {
+    return await _db.getComponentsByFolder(folderId);
   }
-}
 
-class SyncResult {
-  final bool success;
-  final List<InventoryItem> items;
-  final int itemCount;
-  final bool? serverWins;
-  final String? error;
+  Future<Map<String, dynamic>> getStats() async {
+    return await _db.getStats();
+  }
 
-  SyncResult({
-    required this.success,
-    this.items = const [],
-    this.itemCount = 0,
-    this.serverWins,
-    this.error,
-  });
+  Future<Folder> fetchInventoryFromFirmware() async {
+    return await _api.fetchInventory();
+  }
+
+  Future<bool> sendMessage(String message, {String target = 'both'}) async {
+    return await _api.sendMessage(message, target: target);
+  }
+
+  Future<bool> clearMessages() async {
+    return await _api.clearMessages();
+  }
+
+  Future<bool> renameFolder({required String id, required String name}) async {
+    if (isConnected) {
+      await _api.renameFolder(id: id, name: name);
+    }
+    await _db.updateFolderName(id, name);
+    return true;
+  }
+
+  Future<bool> moveFolder({required String id, required String parentId}) async {
+    if (isConnected) {
+      await _api.moveFolder(id: id, parentId: parentId);
+    }
+    final normalizedParent = parentId == 'root' ? '' : parentId;
+    await _db.updateFolderParent(id, normalizedParent);
+    return true;
+  }
+
+  Future<bool> deleteFolder({required String id, bool cascade = false}) async {
+    if (isConnected) {
+      await _api.deleteFolder(id: id, cascade: cascade);
+    }
+    await _db.deleteFolderCascade(id);
+    return true;
+  }
 }

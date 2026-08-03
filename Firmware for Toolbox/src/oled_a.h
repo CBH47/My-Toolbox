@@ -1,6 +1,8 @@
 #ifndef OLED_A_H
 #define OLED_A_H
 
+#include "inventory.h"
+
 void oledA_init();
 void oledA_showMessage(const char* msg);
 bool oledA_hasActiveMessage();

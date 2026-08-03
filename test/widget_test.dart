@@ -9,7 +9,6 @@ void main() {
 
     expect(find.byType(HomePage), findsOneWidget);
     expect(find.text('Toolbox Inventory'), findsOneWidget);
-    expect(find.text('Total Items'), findsOneWidget);
-    expect(find.text('Categories'), findsOneWidget);
+    expect(find.text('Total Components'), findsOneWidget);
   });
 }

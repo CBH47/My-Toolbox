@@ -124,6 +124,8 @@ bool inventory_save_components() {
     }
   }
 
+  // FILE_WRITE appends on SD; remove first so JSON is always rewritten cleanly.
+  SD.remove(COMPONENTS_FILE);
   File file = SD.open(COMPONENTS_FILE, FILE_WRITE);
   if (!file) {
     Serial.println("ERROR: Failed to open components file for writing");
@@ -168,6 +170,8 @@ bool inventory_save_folders() {
     }
   }
 
+  // FILE_WRITE appends on SD; remove first so JSON is always rewritten cleanly.
+  SD.remove(FOLDERS_FILE);
   File file = SD.open(FOLDERS_FILE, FILE_WRITE);
   if (!file) {
     Serial.println("ERROR: Failed to open folders file for writing");
@@ -204,16 +208,43 @@ static Folder* buildFolderTree(JsonArray folders) {
 
   Folder* root = nullptr;
   for (size_t i = 0; i < allFolders.size(); i++) {
+    if (allFolders[i]->id == "root") {
+      root = allFolders[i];
+      break;
+    }
+  }
+
+  if (!root) {
+    root = new Folder();
+    root->name = "Root";
+    root->id = "root";
+    root->parentId = "";
+  }
+
+  for (size_t i = 0; i < allFolders.size(); i++) {
     Folder* f = allFolders[i];
-    if (f->parentId.isEmpty() || f->id == "root") {
-      root = f;
-    } else {
-      for (size_t j = 0; j < allFolders.size(); j++) {
-        if (allFolders[j]->id == f->parentId) {
-          allFolders[j]->subfolders.push_back(f);
-          break;
-        }
+    if (f == root) {
+      continue;
+    }
+
+    if (f->parentId.isEmpty() || f->parentId == "root") {
+      root->subfolders.push_back(f);
+      continue;
+    }
+
+    Folder* parent = nullptr;
+    for (size_t j = 0; j < allFolders.size(); j++) {
+      if (allFolders[j]->id == f->parentId) {
+        parent = allFolders[j];
+        break;
       }
+    }
+
+    if (parent) {
+      parent->subfolders.push_back(f);
+    } else {
+      // Fallback to root when stored parent is missing.
+      root->subfolders.push_back(f);
     }
   }
 

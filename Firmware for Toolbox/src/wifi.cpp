@@ -1,15 +1,18 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
+#include <functional>
 #include "wifi.h"
 #include "oled_a.h"
 #include "oled_b.h"
 #include "inventory.h"
 
-#define AP_SSID "Toolbox-OLED"
+#define AP_SSID "Cam's Toolbox"
 #define AP_PASSWORD ""
 
 static AsyncWebServer server(80);
+static const char* APP_CLIENT_HEADER = "X-Toolbox-Client";
+static const char* APP_CLIENT_VALUE = "mobile-app";
 
 const char index_html[] PROGMEM = R"rawliteral(<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Toolbox Inventory</title>
@@ -18,7 +21,7 @@ h1{text-align:center;color:#00d4ff;}h2{color:#00d4ff;border-bottom:1px solid #33
 form{background:#16213e;padding:15px;border-radius:8px;margin:10px 0;}label{display:block;margin-top:10px;font-weight:bold;}
 input,select{width:100%;padding:8px;margin-top:4px;background:#0f3460;color:#eee;border:1px solid #333;border-radius:4px;box-sizing:border-box;}
 button{display:inline-block;margin:8px 5px 0;padding:10px 20px;font-size:14px;border:none;border-radius:5px;cursor:pointer;color:#fff;}
-.btn-add{background:#2ecc71;}.btn-del{background:#e74c3c;padding:5px 10px;margin:2px;font-size:12px;}
+.btn-add{background:#2ecc71;}
 .btn-save{background:#3498db;}.btn-refresh{background:#9b59b6;}
 #status{text-align:center;margin-top:10px;font-size:14px;color:#aaa;}
 .folder-item{border-left:3px solid #00d4ff;padding-left:10px;margin:5px 0;}
@@ -116,12 +119,13 @@ function updateFolderSelects(folder) {
 }
 
 function buildOptions(f, sel) {
-  for (var i = 0; i < f.subfolders.length; i++) {
+  var subs = f.subfolders || [];
+  for (var i = 0; i < subs.length; i++) {
     var opt = document.createElement('option');
-    opt.value = f.subfolders[i].id;
-    opt.textContent = f.subfolders[i].name;
+    opt.value = subs[i].id;
+    opt.textContent = subs[i].name;
     sel.appendChild(opt);
-    buildOptions(f.subfolders[i], sel);
+    buildOptions(subs[i], sel);
   }
 }
 
@@ -138,28 +142,19 @@ function renderFolderNode(folder, prefix) {
   title.textContent = (prefix ? prefix + ' > ' : '') + folder.name;
   div.appendChild(title);
 
-  for (var i = 0; i < folder.components.length; i++) {
-    var c = folder.components[i];
+  var comps = folder.components || [];
+  for (var i = 0; i < comps.length; i++) {
+    var c = comps[i];
     var row = document.createElement('div');
     row.className = 'comp-row';
     row.innerHTML = '<span class="comp-name">'+c.name+'</span><span>Qty: '+c.quantity+' | $'+c.price+' | ('+c.x+','+c.y+')</span>';
-    var delBtn = document.createElement('button');
-    delBtn.className = 'btn-del';
-    delBtn.textContent = 'Delete';
-    delBtn.onclick = (function(id, fid) { return function() { sendReq('POST', '/api/component/delete?id='+encodeURIComponent(id)+'&folderId='+(fid||'root')); loadInventory(); }; })(c.id, folder.id);
-    row.appendChild(delBtn);
     div.appendChild(row);
   }
 
-  for (var j = 0; j < folder.subfolders.length; j++) {
-    div.appendChild(renderFolderNode(folder.subfolders[j], prefix + 'Sub'));
+  var subs = folder.subfolders || [];
+  for (var j = 0; j < subs.length; j++) {
+    div.appendChild(renderFolderNode(subs[j], prefix + 'Sub'));
   }
-
-  var delFolderBtn = document.createElement('button');
-  delFolderBtn.className = 'btn-del';
-  delFolderBtn.textContent = 'Delete Folder';
-  delFolderBtn.onclick = (function(id) { return function() { sendReq('POST', '/api/folder/delete?id='+encodeURIComponent(id)); loadInventory(); }; })(folder.id);
-  div.appendChild(delFolderBtn);
 
   return div;
 }
@@ -183,9 +178,74 @@ static String generateId() {
   return String(micros()) + "-" + String(random(0xFFFF), HEX);
 }
 
+static String requestArgValue(AsyncWebServerRequest* request, const char* key) {
+  if (request->hasParam(key, true)) {
+    return request->getParam(key, true)->value();
+  }
+  if (request->hasParam(key)) {
+    return request->getParam(key)->value();
+  }
+  return request->arg(key);
+}
+
+static bool removeComponentFromTree(Folder* folder, const String& componentId) {
+  if (!folder) return false;
+  if (folder->removeComponent(componentId)) {
+    return true;
+  }
+  for (size_t i = 0; i < folder->subfolders.size(); i++) {
+    if (removeComponentFromTree(folder->subfolders[i], componentId)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static Folder* findParentFolder(Folder* current, const String& childId) {
+  if (!current) return nullptr;
+  for (size_t i = 0; i < current->subfolders.size(); i++) {
+    Folder* child = current->subfolders[i];
+    if (child && child->id == childId) {
+      return current;
+    }
+    Folder* found = findParentFolder(child, childId);
+    if (found) {
+      return found;
+    }
+  }
+  return nullptr;
+}
+
+static bool folderContainsId(Folder* folder, const String& candidateId) {
+  if (!folder) return false;
+  if (folder->id == candidateId) return true;
+  for (size_t i = 0; i < folder->subfolders.size(); i++) {
+    if (folderContainsId(folder->subfolders[i], candidateId)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static Folder* detachSubfolder(Folder* parent, const String& folderId) {
+  if (!parent) return nullptr;
+  for (size_t i = 0; i < parent->subfolders.size(); i++) {
+    Folder* child = parent->subfolders[i];
+    if (child && child->id == folderId) {
+      parent->subfolders.erase(parent->subfolders.begin() + i);
+      return child;
+    }
+  }
+  return nullptr;
+}
+
 void setupWebServer() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send_P(200, "text/html", index_html);
+  });
+
+  server.on("/api/ping", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/plain", "OK");
   });
 
   server.on("/send", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -206,12 +266,98 @@ void setupWebServer() {
   });
 
   server.on("/api/component", HTTP_POST, [](AsyncWebServerRequest *request) {
-    String name = request->arg("name");
-    int qty = request->arg("quantity").toInt();
-    double price = request->arg("price").toDouble();
-    int x = request->arg("x").toInt();
-    int y = request->arg("y").toInt();
-    String folderId = request->arg("folderId");
+    String action = requestArgValue(request, "action");
+    if (action == "delete") {
+      if (!request->hasHeader(APP_CLIENT_HEADER) || request->getHeader(APP_CLIENT_HEADER)->value() != APP_CLIENT_VALUE) {
+        request->send(403, "text/plain", "Delete is app-only");
+        return;
+      }
+
+      String componentId = requestArgValue(request, "id");
+      String folderId = requestArgValue(request, "folderId");
+      if (componentId.length() == 0) {
+        request->send(400, "text/plain", "Missing component id");
+        return;
+      }
+
+      Folder* root = inventory_getRoot();
+      if (!root) {
+        request->send(503, "text/plain", "Inventory not ready");
+        return;
+      }
+
+      bool removed = false;
+      if (folderId.length() > 0 && folderId != "root") {
+        Folder* targetFolder = root->findSubfolder(folderId);
+        if (!targetFolder) {
+          request->send(404, "text/plain", "Folder not found");
+          return;
+        }
+        removed = targetFolder->removeComponent(componentId);
+        if (!removed) {
+          removed = removeComponentFromTree(root, componentId);
+        }
+      } else {
+        removed = removeComponentFromTree(root, componentId);
+      }
+
+      if (!removed) {
+        request->send(404, "text/plain", "Component not found");
+        return;
+      }
+
+      if (inventory_save_all()) {
+        request->send(200, "text/plain", "Component deleted");
+      } else {
+        request->send(500, "text/plain", "Failed to save to SD card");
+      }
+      return;
+    }
+
+    String id = requestArgValue(request, "id");
+    String name = requestArgValue(request, "name");
+    int qty = requestArgValue(request, "quantity").toInt();
+    double price = requestArgValue(request, "price").toDouble();
+    int x = requestArgValue(request, "x").toInt();
+    int y = requestArgValue(request, "y").toInt();
+    String folderId = requestArgValue(request, "folderId");
+
+    // Safety net: if an app-authenticated request includes only id (no name), treat it as delete.
+    const bool isAppClient = request->hasHeader(APP_CLIENT_HEADER) && request->getHeader(APP_CLIENT_HEADER)->value() == APP_CLIENT_VALUE;
+    if (isAppClient && id.length() > 0 && name.length() == 0) {
+      Folder* root = inventory_getRoot();
+      if (!root) {
+        request->send(503, "text/plain", "Inventory not ready");
+        return;
+      }
+
+      bool removed = false;
+      if (folderId.length() > 0 && folderId != "root") {
+        Folder* targetFolder = root->findSubfolder(folderId);
+        if (!targetFolder) {
+          request->send(404, "text/plain", "Folder not found");
+          return;
+        }
+        removed = targetFolder->removeComponent(id);
+        if (!removed) {
+          removed = removeComponentFromTree(root, id);
+        }
+      } else {
+        removed = removeComponentFromTree(root, id);
+      }
+
+      if (!removed) {
+        request->send(404, "text/plain", "Component not found");
+        return;
+      }
+
+      if (inventory_save_all()) {
+        request->send(200, "text/plain", "Component deleted");
+      } else {
+        request->send(500, "text/plain", "Failed to save to SD card");
+      }
+      return;
+    }
 
     if (name.length() == 0) {
       request->send(400, "text/plain", "Missing name");
@@ -219,18 +365,22 @@ void setupWebServer() {
     }
 
     Folder* root = inventory_getRoot();
+    if (!root) {
+      request->send(503, "text/plain", "Inventory not ready");
+      return;
+    }
     Folder* targetFolder = root;
 
     if (folderId.length() > 0 && folderId != "root") {
       targetFolder = root->findSubfolder(folderId);
       if (!targetFolder) {
-        request->send(404, "text/plain", "Folder not found");
-        return;
+        Serial.printf("Delete request referenced missing folder '%s'; falling back to full-tree search\n", folderId.c_str());
+        targetFolder = root;
       }
     }
 
     Component comp;
-    comp.id = generateId();
+    comp.id = id.length() > 0 ? id : generateId();
     comp.name = name;
     comp.quantity = qty;
     comp.price = price;
@@ -246,39 +396,64 @@ void setupWebServer() {
     }
   });
 
-  server.on("/api/component/delete", HTTP_POST, [](AsyncWebServerRequest *request) {
-    String compId = request->arg("id");
-    String folderId = request->arg("folderId");
 
-    if (compId.length() == 0) {
-      request->send(400, "text/plain", "Missing component id");
-      return;
-    }
+  server.on("/api/folder", HTTP_POST, [](AsyncWebServerRequest *request) {
+    String action = requestArgValue(request, "action");
+    String id = requestArgValue(request, "id");
+    String name = requestArgValue(request, "name");
+    String parentId = requestArgValue(request, "parentId");
+    String cascadeRaw = requestArgValue(request, "cascade");
+    bool cascade = cascadeRaw == "1" || cascadeRaw == "true" || cascadeRaw == "TRUE";
 
-    Folder* root = inventory_getRoot();
-    Folder* targetFolder = root;
+    const bool isAppClient = request->hasHeader(APP_CLIENT_HEADER) && request->getHeader(APP_CLIENT_HEADER)->value() == APP_CLIENT_VALUE;
 
-    if (folderId.length() > 0 && folderId != "root") {
-      targetFolder = root->findSubfolder(folderId);
-      if (!targetFolder) {
+    // Compatibility path for older app flows: accept delete through /api/folder.
+    const bool looksLikeLegacyDelete = isAppClient && id.length() > 0 && name.length() == 0 && parentId.length() == 0;
+    if (action == "delete" || looksLikeLegacyDelete) {
+      if (!isAppClient) {
+        request->send(403, "text/plain", "Folder management is app-only");
+        return;
+      }
+      if (id == "root") {
+        request->send(400, "text/plain", "Invalid folder id");
+        return;
+      }
+
+      Folder* root = inventory_getRoot();
+      if (!root) {
+        request->send(503, "text/plain", "Inventory not ready");
+        return;
+      }
+
+      Folder* target = root->findSubfolder(id);
+      if (!target) {
         request->send(404, "text/plain", "Folder not found");
         return;
       }
-    }
 
-    bool removed = targetFolder->removeComponent(compId);
-    if (removed && inventory_save_all()) {
-      request->send(200, "text/plain", "Component deleted");
-    } else if (!removed) {
-      request->send(404, "text/plain", "Component not found");
-    } else {
-      request->send(500, "text/plain", "Failed to save to SD card");
-    }
-  });
+      if (!cascade && (!target->components.empty() || !target->subfolders.empty())) {
+        request->send(409, "text/plain", "Folder not empty");
+        return;
+      }
 
-  server.on("/api/folder", HTTP_POST, [](AsyncWebServerRequest *request) {
-    String name = request->arg("name");
-    String parentId = request->arg("parentId");
+      Folder* parent = findParentFolder(root, id);
+      if (!parent) {
+        request->send(404, "text/plain", "Parent folder not found");
+        return;
+      }
+
+      if (!parent->removeSubfolder(id)) {
+        request->send(500, "text/plain", "Failed to delete folder");
+        return;
+      }
+
+      if (inventory_save_all()) {
+        request->send(200, "text/plain", "Folder deleted");
+      } else {
+        request->send(500, "text/plain", "Failed to save to SD card");
+      }
+      return;
+    }
 
     if (name.length() == 0) {
       request->send(400, "text/plain", "Missing folder name");
@@ -286,6 +461,10 @@ void setupWebServer() {
     }
 
     Folder* root = inventory_getRoot();
+    if (!root) {
+      request->send(503, "text/plain", "Inventory not ready");
+      return;
+    }
     Folder* targetFolder = root;
 
     if (parentId.length() > 0 && parentId != "root") {
@@ -298,7 +477,7 @@ void setupWebServer() {
 
     Folder* newFolder = new Folder();
     newFolder->name = name;
-    newFolder->id = generateId();
+    newFolder->id = id.length() > 0 ? id : generateId();
     newFolder->parentId = (parentId.length() > 0 && parentId != "root") ? parentId : "";
 
     targetFolder->addSubfolder(newFolder);
@@ -310,50 +489,152 @@ void setupWebServer() {
     }
   });
 
-  server.on("/api/folder/delete", HTTP_POST, [](AsyncWebServerRequest *request) {
-    String id = request->arg("id");
+  server.on("/api/folder/rename", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!request->hasHeader(APP_CLIENT_HEADER) || request->getHeader(APP_CLIENT_HEADER)->value() != APP_CLIENT_VALUE) {
+      request->send(403, "text/plain", "Folder management is app-only");
+      return;
+    }
 
-    if (id.length() == 0 || id == "root") {
-      request->send(400, "text/plain", "Cannot delete root folder");
+    String folderId = requestArgValue(request, "id");
+    String name = requestArgValue(request, "name");
+
+    if (folderId.length() == 0 || folderId == "root") {
+      request->send(400, "text/plain", "Invalid folder id");
+      return;
+    }
+    if (name.length() == 0) {
+      request->send(400, "text/plain", "Missing folder name");
       return;
     }
 
     Folder* root = inventory_getRoot();
-    
-    // Find the folder and its parent to move components up
-    std::vector<Folder*> stack;
-    stack.push_back(root);
-    Folder* targetFolder = nullptr;
-    Folder* parentFolder = nullptr;
-
-    while (!stack.empty()) {
-      Folder* current = stack.back();
-      stack.pop_back();
-
-      for (size_t i = 0; i < current->subfolders.size(); i++) {
-        if (current->subfolders[i]->id == id) {
-          targetFolder = current->subfolders[i];
-          parentFolder = current;
-          break;
-        }
-        stack.push_back(current->subfolders[i]);
-      }
-      if (targetFolder) break;
+    if (!root) {
+      request->send(503, "text/plain", "Inventory not ready");
+      return;
     }
 
-    if (!targetFolder || !parentFolder) {
+    Folder* target = root->findSubfolder(folderId);
+    if (!target) {
       request->send(404, "text/plain", "Folder not found");
       return;
     }
 
-    // Move components from deleted folder to parent folder
-    for (size_t i = 0; i < targetFolder->components.size(); i++) {
-      targetFolder->components[i].folderId = parentFolder->id;
-      parentFolder->addComponent(targetFolder->components[i]);
+    target->name = name;
+    if (inventory_save_all()) {
+      request->send(200, "text/plain", "Folder renamed");
+    } else {
+      request->send(500, "text/plain", "Failed to save to SD card");
+    }
+  });
+
+  server.on("/api/folder/move", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!request->hasHeader(APP_CLIENT_HEADER) || request->getHeader(APP_CLIENT_HEADER)->value() != APP_CLIENT_VALUE) {
+      request->send(403, "text/plain", "Folder management is app-only");
+      return;
     }
 
-    parentFolder->removeSubfolder(id);
-    
+    String folderId = requestArgValue(request, "id");
+    String newParentId = requestArgValue(request, "parentId");
+
+    if (folderId.length() == 0 || folderId == "root") {
+      request->send(400, "text/plain", "Invalid folder id");
+      return;
+    }
+
+    Folder* root = inventory_getRoot();
+    if (!root) {
+      request->send(503, "text/plain", "Inventory not ready");
+      return;
+    }
+
+    Folder* target = root->findSubfolder(folderId);
+    if (!target) {
+      request->send(404, "text/plain", "Folder not found");
+      return;
+    }
+
+    Folder* newParent = root;
+    if (newParentId.length() > 0 && newParentId != "root") {
+      newParent = root->findSubfolder(newParentId);
+      if (!newParent) {
+        request->send(404, "text/plain", "Destination folder not found");
+        return;
+      }
+    }
+
+    if (newParent->id == target->id || folderContainsId(target, newParent->id)) {
+      request->send(400, "text/plain", "Invalid destination");
+      return;
+    }
+
+    Folder* oldParent = findParentFolder(root, folderId);
+    if (!oldParent) {
+      request->send(404, "text/plain", "Current parent not found");
+      return;
+    }
+
+    Folder* detached = detachSubfolder(oldParent, folderId);
+    if (!detached) {
+      request->send(500, "text/plain", "Failed to detach folder");
+      return;
+    }
+
+    detached->parentId = (newParent == root) ? "" : newParent->id;
+    newParent->addSubfolder(detached);
+
+    if (inventory_save_all()) {
+      request->send(200, "text/plain", "Folder moved");
+    } else {
+      detachSubfolder(newParent, detached->id);
+      oldParent->addSubfolder(detached);
+      detached->parentId = oldParent->id == "root" ? "" : oldParent->id;
+      request->send(500, "text/plain", "Failed to save to SD card");
+    }
+  });
+
+  server.on("/api/folder/delete", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!request->hasHeader(APP_CLIENT_HEADER) || request->getHeader(APP_CLIENT_HEADER)->value() != APP_CLIENT_VALUE) {
+      request->send(403, "text/plain", "Folder management is app-only");
+      return;
+    }
+
+    String folderId = requestArgValue(request, "id");
+    String cascadeRaw = requestArgValue(request, "cascade");
+    bool cascade = cascadeRaw == "1" || cascadeRaw == "true" || cascadeRaw == "TRUE";
+
+    if (folderId.length() == 0 || folderId == "root") {
+      request->send(400, "text/plain", "Invalid folder id");
+      return;
+    }
+
+    Folder* root = inventory_getRoot();
+    if (!root) {
+      request->send(503, "text/plain", "Inventory not ready");
+      return;
+    }
+
+    Folder* target = root->findSubfolder(folderId);
+    if (!target) {
+      request->send(404, "text/plain", "Folder not found");
+      return;
+    }
+
+    if (!cascade && (!target->components.empty() || !target->subfolders.empty())) {
+      request->send(409, "text/plain", "Folder not empty");
+      return;
+    }
+
+    Folder* parent = findParentFolder(root, folderId);
+    if (!parent) {
+      request->send(404, "text/plain", "Parent folder not found");
+      return;
+    }
+
+    if (!parent->removeSubfolder(folderId)) {
+      request->send(500, "text/plain", "Failed to delete folder");
+      return;
+    }
+
     if (inventory_save_all()) {
       request->send(200, "text/plain", "Folder deleted");
     } else {
@@ -361,61 +642,88 @@ void setupWebServer() {
     }
   });
 
+  server.on("/api/component/delete", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!request->hasHeader(APP_CLIENT_HEADER) || request->getHeader(APP_CLIENT_HEADER)->value() != APP_CLIENT_VALUE) {
+      request->send(403, "text/plain", "Delete is app-only");
+      return;
+    }
+
+    String componentId = requestArgValue(request, "id");
+    String folderId = requestArgValue(request, "folderId");
+
+    if (componentId.length() == 0) {
+      request->send(400, "text/plain", "Missing component id");
+      return;
+    }
+
+    Folder* root = inventory_getRoot();
+    if (!root) {
+      request->send(503, "text/plain", "Inventory not ready");
+      return;
+    }
+
+    bool removed = false;
+    if (folderId.length() > 0 && folderId != "root") {
+      Folder* targetFolder = root->findSubfolder(folderId);
+      if (!targetFolder) {
+        request->send(404, "text/plain", "Folder not found");
+        return;
+      }
+      removed = targetFolder->removeComponent(componentId);
+      if (!removed) {
+        // Fallback in case stale folder context was provided by the app.
+        removed = removeComponentFromTree(root, componentId);
+      }
+    } else {
+      removed = removeComponentFromTree(root, componentId);
+    }
+
+    if (!removed) {
+      request->send(404, "text/plain", "Component not found");
+      return;
+    }
+
+    if (inventory_save_all()) {
+      request->send(200, "text/plain", "Component deleted");
+    } else {
+      request->send(500, "text/plain", "Failed to save to SD card");
+    }
+  });
+
   server.on("/api/inventory", HTTP_GET, [](AsyncWebServerRequest *request) {
     Folder* root = inventory_getRoot();
-    JsonDocument doc;
-    
-    // Build tree structure for the web UI (nested format)
-    doc["id"] = root->id;
-    doc["name"] = root->name;
-    doc["components"] = JsonArray();
-    doc["subfolders"] = JsonArray();
-
-    for (size_t i = 0; i < root->components.size(); i++) {
-      JsonDocument compDoc;
-      compDoc["id"] = root->components[i].id;
-      compDoc["name"] = root->components[i].name;
-      compDoc["quantity"] = root->components[i].quantity;
-      compDoc["price"] = root->components[i].price;
-      compDoc["x"] = root->components[i].x;
-      compDoc["y"] = root->components[i].y;
-      doc["components"].add(compDoc);
+    if (!root) {
+      request->send(503, "application/json", "{\"id\":\"root\",\"name\":\"Root\",\"components\":[],\"subfolders\":[]}");
+      return;
     }
 
-    for (size_t i = 0; i < root->subfolders.size(); i++) {
-      // Recursively build subfolder nodes
-      std::vector<Folder*> stack;
-      stack.push_back(root->subfolders[i]);
-      
-      while (!stack.empty()) {
-        Folder* f = stack.back();
-        stack.pop_back();
+    // Build nested tree structure and always include empty arrays for UI stability.
+    std::function<void(Folder*, JsonObject)> buildNode = [&](Folder* f, JsonObject node) {
+      node["id"] = f->id;
+      node["name"] = f->name;
 
-        JsonDocument folderDoc;
-        folderDoc["id"] = f->id;
-        folderDoc["name"] = f->name;
-        
-        for (size_t j = 0; j < f->components.size(); j++) {
-          JsonDocument compDoc;
-          compDoc["id"] = f->components[j].id;
-          compDoc["name"] = f->components[j].name;
-          compDoc["quantity"] = f->components[j].quantity;
-          compDoc["price"] = f->components[j].price;
-          compDoc["x"] = f->components[j].x;
-          compDoc["y"] = f->components[j].y;
-          folderDoc["components"].add(compDoc);
-        }
-
-        for (size_t j = 0; j < f->subfolders.size(); j++) {
-          stack.push_back(f->subfolders[j]);
-        }
-
-        doc["subfolders"].add(folderDoc);
+      JsonArray components = node["components"].to<JsonArray>();
+      for (size_t i = 0; i < f->components.size(); i++) {
+        JsonObject comp = components.add<JsonObject>();
+        comp["id"] = f->components[i].id;
+        comp["name"] = f->components[i].name;
+        comp["quantity"] = f->components[i].quantity;
+        comp["price"] = f->components[i].price;
+        comp["x"] = f->components[i].x;
+        comp["y"] = f->components[i].y;
       }
-    }
 
+      JsonArray subfolders = node["subfolders"].to<JsonArray>();
+      for (size_t i = 0; i < f->subfolders.size(); i++) {
+        JsonObject subNode = subfolders.add<JsonObject>();
+        buildNode(f->subfolders[i], subNode);
+      }
+    };
+
+    JsonDocument rootDoc;
+    buildNode(root, rootDoc.to<JsonObject>());
     String output;
-    serializeJson(doc, output);
+    serializeJson(rootDoc, output);
     request->send(200, "application/json", output);
   });
 
@@ -423,7 +731,11 @@ void setupWebServer() {
 }
 
 void wifiTask(void* parameter) {
-  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  WiFi.mode(WIFI_AP);
+  bool apStarted = WiFi.softAP(AP_SSID, AP_PASSWORD);
+  if (!apStarted) {
+    Serial.println("ERROR: Failed to start WiFi AP");
+  }
   Serial.printf("WiFi AP started: %s\n", AP_SSID);
   Serial.printf("Connect to: http://%s\n", WiFi.softAPIP().toString().c_str());
 

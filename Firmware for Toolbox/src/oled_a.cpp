@@ -17,6 +17,30 @@ void oledA_showMessage(const char* msg) {
   strncpy(messageBuf, msg, sizeof(messageBuf) - 1);
   messageBuf[sizeof(messageBuf) - 1] = '\0';
   messageTime = millis();
+
+  oled_a.clearDisplay();
+  oled_a.setTextSize(1);
+  oled_a.setTextColor(SSD1306_WHITE);
+  oled_a.setCursor(2, 5);
+  oled_a.println("OLED A - Message");
+
+  int y = 18;
+  const char* msgLines[6];
+  uint8_t lineCount = 0;
+  const char* p = messageBuf;
+  while (*p && lineCount < 6) {
+    msgLines[lineCount++] = p;
+    p++;
+    while (*p && *p != '\n' && *p != '\r') p++;
+    if (*p == '\n' || *p == '\r') p += (*p == '\n') ? 1 : 2;
+  }
+
+  for (uint8_t i = 0; i < lineCount && y < 58; i++) {
+    oled_a.setCursor(2, y);
+    oled_a.println(msgLines[i]);
+    y += 9;
+  }
+  oled_a.display();
 }
 
 bool oledA_hasActiveMessage() {
@@ -60,6 +84,7 @@ void oledA_showStatus(const char *title, const char **debugLines, uint8_t debugC
   if (oledA_hasActiveMessage()) {
     oled_a.clearDisplay();
     oled_a.setTextSize(1);
+    oled_a.setTextColor(SSD1306_WHITE);
     oled_a.setCursor(2, 5);
     oled_a.println("OLED A - Message");
     int y = 18;
@@ -82,24 +107,18 @@ void oledA_showStatus(const char *title, const char **debugLines, uint8_t debugC
   }
 
   oled_a.clearDisplay();
-  oled_a.setTextSize(2);
-  oled_a.setCursor(10, 10);
-  oled_a.print(title);
+  oled_a.setTextColor(SSD1306_WHITE);
 
-  int y = 35;
-  oled_a.setTextSize(1);
-  oled_a.setCursor(5, y);
-  oled_a.println("OLED A - Primary");
-  y += 10;
+  if (title && title[0] != '\0') {
+    oled_a.setTextSize(2);
+    oled_a.setCursor(10, 10);
+    oled_a.print(title);
+  }
 
-  char buf[24];
-  snprintf(buf, sizeof(buf), "Uptime: %lus", (unsigned long)(millis() / 1000));
-  oled_a.setCursor(5, y);
-  oled_a.println(buf);
-  y += 10;
-
+  int y = title && title[0] != '\0' ? 35 : 5;
   for (uint8_t i = 0; i < debugCount && y < 60; i++) {
     if (debugLines[i] == nullptr) continue;
+    oled_a.setTextSize(1);
     oled_a.setCursor(5, y);
     oled_a.println(debugLines[i]);
     y += 10;
